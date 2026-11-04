@@ -30,7 +30,7 @@
  * 自身的地址不转发（防环）。
  */
 
-import { Capacitor } from '@capacitor/core';
+import { Capacitor, CapacitorHttp } from '@capacitor/core';
 import { getProxyWorkerUrl } from './proxyWorker';
 
 /** 已确认浏览器直连必挂（无 CORS）的官方域名，从第一次请求起就走代理。 */
@@ -133,6 +133,90 @@ const ROUTE_LS_KEY = 'sully_llm_relay_route_v1';
 
 const isNativeCapacitor = (): boolean => {
     try { return Capacitor.isNativePlatform(); } catch { return false; }
+};
+
+// ─── 原生壳（安卓/iOS）传输 ───
+
+/** 原生平台只透传这些头（与转发层同一套白名单）。 */
+const NATIVE_FORWARD_HEADERS = [
+    'authorization',
+    'content-type',
+    'x-api-key',
+    'anthropic-version',
+    'anthropic-beta',
+    'anthropic-dangerous-direct-browser-access',
+    'x-goog-api-key',
+    'accept',
+];
+
+const readHeaders = (src: HeadersInit | undefined): Record<string, string> => {
+    const out: Record<string, string> = {};
+    if (!src) return out;
+    if (src instanceof Headers) src.forEach((v, k) => { out[k.toLowerCase()] = v; });
+    else if (Array.isArray(src)) for (const [k, v] of src) out[k.toLowerCase()] = v;
+    else for (const [k, v] of Object.entries(src)) out[k.toLowerCase()] = v;
+    return out;
+};
+
+/**
+ * 原生 App 里的 LLM 传输：走 Android/iOS 原生网络栈（CapacitorHttp），
+ * 没有浏览器 CORS 限制——英伟达 / OpenAI 这类接口直接通，零代理、零账号、
+ * 零配置。项目是 Capacitor 6，CapacitorHttp 在 @capacitor/core 里自带。
+ *
+ * 原生桥不支持流式响应，所以把 body 里的 stream 置为 false，让上游返回整包
+ * JSON。safeApi 的 parseRawBodyText 本来就按 content-type 分流（SSE 或 JSON），
+ * 整包 JSON 能正常解析，代价是回复一次性出现而不是逐字打出。
+ *
+ * 只在 shouldRelayLlmUrl 命中的域名上启用；国内服务商在 WebView 里本来就能
+ * 直连，维持原状不动。
+ */
+export const nativeLlmFetch = async (resource: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = typeof resource === 'string'
+        ? resource
+        : resource instanceof URL
+            ? resource.href
+            : resource.url;
+    const srcHeaders = {
+        ...(typeof resource === 'object' && !(resource instanceof URL) && 'headers' in resource
+            ? readHeaders(resource.headers as HeadersInit)
+            : {}),
+        ...readHeaders(init?.headers),
+    };
+    const headers: Record<string, string> = {};
+    for (const key of NATIVE_FORWARD_HEADERS) if (srcHeaders[key]) headers[key] = srcHeaders[key];
+
+    let data: unknown;
+    if (typeof init?.body === 'string' && init.body) {
+        try {
+            const parsed = JSON.parse(init.body);
+            if (parsed && typeof parsed === 'object' && (parsed as any).stream === true) {
+                (parsed as any).stream = false; // 原生桥没有 SSE，改要整包 JSON
+            }
+            data = parsed;
+        } catch {
+            data = init.body;
+        }
+    }
+
+    const method = (init?.method
+        || (typeof resource === 'object' && !(resource instanceof URL) && 'method' in resource ? (resource as Request).method : 'GET')
+    ).toUpperCase();
+
+    let res: { status?: number; headers?: Record<string, string>; data?: unknown };
+    try {
+        res = await CapacitorHttp.request({ method, url, headers, data, responseType: 'text' });
+    } catch (e) {
+        // 对齐 fetch 语义：网络层失败抛 TypeError，上层（OSContext 拦截器）按这个识别。
+        throw new TypeError(`Failed to fetch (native): ${(e as any)?.message || e}`);
+    }
+
+    const responseHeaders = new Headers();
+    for (const [k, v] of Object.entries(res.headers || {})) {
+        try { responseHeaders.set(k, String(v)); } catch { /* 忽略非法头 */ }
+    }
+    const text = typeof res.data === 'string' ? res.data : JSON.stringify(res.data ?? '');
+    const status = res.status && res.status >= 200 && res.status <= 599 ? res.status : 200;
+    return new Response(text, { status, headers: responseHeaders });
 };
 
 /** 同源 /api/llm 只有在真浏览器 + http(s) 页面时才可能存在。 */

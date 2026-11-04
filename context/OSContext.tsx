@@ -66,7 +66,7 @@ import { loadChatInputPreferences, saveChatInputPreferences } from '../utils/cha
 import { collectAppearance, collectCharSettings, collectDataScale, collectFeatureFlagsAsync, collectSARFeatureFlags } from '../utils/analyticsSnapshot';
 import { normalizeApiConfig, normalizeApiPreset } from '../utils/apiConfigNormalize';
 import { fetchLlm } from '../utils/anthropicApi';
-import { buildLlmRelayUrl, getLlmRelayRoute, isLlmRelayCandidateUrl, isLlmRelayUnavailableResponse, markLlmHostNeedsRelay, markLlmRelayApiUnavailable, shouldRelayLlmUrl, type LlmRelayRoute } from '../utils/llmRelay';
+import { buildLlmRelayUrl, getLlmRelayRoute, isLlmRelayCandidateUrl, isLlmRelayUnavailableResponse, markLlmHostNeedsRelay, markLlmRelayApiUnavailable, nativeLlmFetch, shouldRelayLlmUrl, type LlmRelayRoute } from '../utils/llmRelay';
 import { getCheckPhoneApi, setCheckPhoneApi } from '../utils/checkPhoneApi';
 import { markBackupDone } from '../utils/backupReminder';
 import { collectSARLocalBackup, restoreSARLocalBackup } from '../utils/vrWorld/sarBackup';
@@ -1277,7 +1277,13 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           const relayLlm = shouldRelayLlmUrl(urlStr);
           let transport = originalFetch;
           let usedLlmRelayRoute: LlmRelayRoute | null = null;
-          if (relayLlm) {
+          let isNativeLlm = false;
+          try { isNativeLlm = Capacitor.isNativePlatform(); } catch { /* 非原生环境 */ }
+          if (relayLlm && isNativeLlm) {
+              // 原生壳（安卓/iOS）：走原生网络栈直连，没有 CORS，不需要任何代理
+              // （零账号零配置）。stream 会被置为 false，回复整包出现。
+              transport = nativeLlmFetch as typeof fetch;
+          } else if (relayLlm) {
               usedLlmRelayRoute = getLlmRelayRoute();
               const relayRoute = usedLlmRelayRoute;
               transport = ((resource: RequestInfo | URL, relayInit?: RequestInit) => {

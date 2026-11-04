@@ -9,11 +9,18 @@ import {
   LLM_RELAY_HEADER,
   markLlmHostNeedsRelay,
   markLlmRelayApiUnavailable,
+  nativeLlmFetch,
   resetLlmRelayLearnedHosts,
   resetLlmRelayRoute,
   shouldRelayLlmUrl,
 } from './llmRelay';
+import { CapacitorHttp } from '@capacitor/core';
 import { DEFAULT_PROXY_WORKER, setProxyWorkerUrl } from './proxyWorker';
+
+vi.mock('@capacitor/core', () => ({
+  Capacitor: { isNativePlatform: vi.fn(() => false) },
+  CapacitorHttp: { request: vi.fn() },
+}));
 
 describe('llmRelay 海外 LLM 代理转发', () => {
   beforeEach(() => {
@@ -119,6 +126,47 @@ describe('llmRelay 海外 LLM 代理转发', () => {
     expect(isLlmRelayUnavailableResponse(withHeader(429))).toBe(false);
     expect(isLlmRelayUnavailableResponse(noHeader(401))).toBe(false);
     expect(isLlmRelayUnavailableResponse(noHeader(200))).toBe(false);
+  });
+
+  it('nativeLlmFetch 原生传输：stream 置 false、鉴权头透传、杂头丢弃、整包 JSON 返回', async () => {
+    vi.mocked(CapacitorHttp.request).mockResolvedValue({
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+      data: '{"choices":[{"message":{"content":"你好"}}]}',
+    } as any);
+    const res = await nativeLlmFetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer nvapi-k', 'Content-Type': 'application/json', Cookie: 's=1' },
+      body: JSON.stringify({ model: 'm', messages: [], stream: true }),
+    });
+    const call = vi.mocked(CapacitorHttp.request).mock.calls[0][0] as any;
+    expect(call.url).toBe('https://integrate.api.nvidia.com/v1/chat/completions');
+    expect(call.method).toBe('POST');
+    expect(call.headers.authorization).toBe('Bearer nvapi-k');
+    expect(call.headers.cookie).toBeUndefined();
+    expect(call.data.stream).toBe(false); // 原生桥没有 SSE，改要整包
+    expect(call.data.model).toBe('m');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('application/json');
+    expect(JSON.parse(await res.text()).choices[0].message.content).toBe('你好');
+  });
+
+  it('nativeLlmFetch GET 无 body / Anthropic 头透传 / 网络失败抛 TypeError', async () => {
+    vi.mocked(CapacitorHttp.request).mockResolvedValue({ status: 401, headers: {}, data: '{"error":"no"}' } as any);
+    vi.mocked(CapacitorHttp.request).mockClear();
+    const res = await nativeLlmFetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': 'k', 'anthropic-version': '2023-06-01' },
+      body: '{"model":"m"}',
+    });
+    const call = vi.mocked(CapacitorHttp.request).mock.calls[0][0] as any;
+    expect(call.headers['x-api-key']).toBe('k');
+    expect(call.headers['anthropic-version']).toBe('2023-06-01');
+    expect(res.status).toBe(401);
+
+    vi.mocked(CapacitorHttp.request).mockRejectedValue(new Error('Connection refused'));
+    await expect(nativeLlmFetch('https://integrate.api.nvidia.com/v1/models'))
+      .rejects.toBeInstanceOf(TypeError); // 上层靠 TypeError 识别网络型失败
   });
 
   it('指向代理 Worker 自身的地址不转发（防套娃）', () => {
