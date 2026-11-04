@@ -1,5 +1,6 @@
 import { isAnthropicEndpoint, nativeRequestUrl } from './llmEndpoint';
 import { modelRejectsSamplingParams } from './samplingParamCompat';
+import { redirectNvidiaRequest } from './nvidiaProxy';
 
 type Block = Record<string, any>;
 type FetchTransport = typeof fetch & { __sullyAnthropic?: boolean };
@@ -211,6 +212,12 @@ function convertAnthropicStream(response: Response): Response {
 export async function fetchLlm(resource: RequestInfo | URL, init?: RequestInit, transport: typeof fetch = globalThis.fetch, browser = typeof window !== 'undefined'): Promise<Response> {
     if ((transport as FetchTransport).__sullyAnthropic) return transport(resource,init);
     const inputUrl = typeof resource === 'string' ? resource : resource instanceof URL ? resource.href : resource.url;
+    // NVIDIA 官方接口没有 CORS 头，浏览器直连必被拦。统一改写到同源的 Netlify Function；
+    // 其他服务商（含 Anthropic）仍然直连。
+    if (browser) {
+        const nvidia = await redirectNvidiaRequest(resource, init, inputUrl);
+        if (nvidia) return transport(nvidia.url, nvidia.init);
+    }
     if (!isAnthropicEndpoint(inputUrl)) return transport(resource,init);
     const request = resource instanceof Request ? resource : undefined;
     const method=(init?.method || request?.method || 'GET').toUpperCase();
