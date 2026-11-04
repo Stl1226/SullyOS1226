@@ -296,7 +296,7 @@ function corsHeaders(origin) {
   return {
     "Access-Control-Allow-Origin": origin || "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, xi-api-key, model, language, X-MiniMax-Region, X-MiniMax-API-Key, Depth, X-Brave-API-Key, X-Notion-API-Key, X-Feishu-Token, X-Xhs-Cookie, X-Xhs-Platform, X-Rnote-API-Key, X-Xhs-Experiment-Ack, X-Netease-Cookie, X-WebDAV-Method, X-WebDAV-Depth, X-WebDAV-Range, X-GitHub-Method, X-GitHub-Api-Version, X-CF-Method, Mcp-Session-Id, Accept, Range",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, xi-api-key, model, language, X-MiniMax-Region, X-MiniMax-API-Key, Depth, X-Brave-API-Key, X-Notion-API-Key, X-Feishu-Token, X-Xhs-Cookie, X-Xhs-Platform, X-Rnote-API-Key, X-Xhs-Experiment-Ack, X-Netease-Cookie, X-WebDAV-Method, X-WebDAV-Depth, X-WebDAV-Range, X-GitHub-Method, X-GitHub-Api-Version, X-CF-Method, Mcp-Session-Id, Accept, Range, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, x-goog-api-key",
     "Access-Control-Expose-Headers": "Mcp-Session-Id",
     "Access-Control-Max-Age": "86400",
   };
@@ -4138,6 +4138,74 @@ export default {
         return new Response(upstream.body, { status: upstream.status, headers: respHeaders });
       } catch (e) {
         return jsonResponse({ error: 'Fish Audio upstream fetch failed', detail: String(e && e.message || e) }, { status: 502, origin });
+      }
+    }
+
+    // ========== 海外 LLM 白名单透传代理 (/llm?target=<绝对地址>) ==========
+    // 背景：一批海外大模型接口（英伟达 integrate.api.nvidia.com、OpenAI 等）不返回
+    // CORS 头，浏览器直连 fetch 必被拦；部分域名国内直连也不可达。这里做白名单纯透传：
+    // 只放行白名单内的 LLM 域名、只转发鉴权/内容头、不读不存 key、SSE 流式原样回传。
+    // 前端在 utils/llmRelay.ts 决定是否转发；自托管 Worker 的用户改了白名单即可扩展。
+    if (url.pathname === '/llm') {
+      if (request.method !== 'GET' && request.method !== 'POST') {
+        return jsonResponse({ error: 'Method not allowed' }, { status: 405, origin });
+      }
+      const targetUrl = url.searchParams.get('target');
+      if (!targetUrl) {
+        return jsonResponse({ error: 'Missing target parameter' }, { status: 400, origin });
+      }
+      let parsed;
+      try {
+        parsed = new URL(targetUrl);
+      } catch {
+        return jsonResponse({ error: 'Invalid target URL' }, { status: 400, origin });
+      }
+      // 白名单：常见海外 LLM 服务商（含 OpenAI 兼容端点）。只允许 https。
+      const LLM_HOSTS = new Set([
+        'integrate.api.nvidia.com',     // 英伟达 NIM
+        'api.openai.com',
+        'api.anthropic.com',
+        'api.x.ai',
+        'api.mistral.ai',
+        'api.groq.com',
+        'api.together.xyz',
+        'api.perplexity.ai',
+        'api.cohere.com',
+        'api.fireworks.ai',
+        'api.cerebras.ai',
+        'openrouter.ai',
+        'generativelanguage.googleapis.com',
+        'api.deepseek.com',
+        'api.moonshot.ai',
+      ]);
+      const hostAllowed = (host) => {
+        const h = host.toLowerCase();
+        if (LLM_HOSTS.has(h)) return true;
+        for (const allowed of LLM_HOSTS) if (h.endsWith('.' + allowed)) return true;
+        return false;
+      };
+      if (parsed.protocol !== 'https:' || parsed.username || parsed.password || !hostAllowed(parsed.hostname)) {
+        return jsonResponse({ error: 'Host not allowed' }, { status: 400, origin });
+      }
+      try {
+        const forwardHeaders = {};
+        // 只透传 LLM 调用需要的头，避免把浏览器侧杂头带过去。
+        for (const name of ['authorization', 'x-api-key', 'anthropic-version', 'anthropic-beta', 'anthropic-dangerous-direct-browser-access', 'x-goog-api-key', 'content-type', 'accept']) {
+          const value = request.headers.get(name);
+          if (value) forwardHeaders[name] = value;
+        }
+        if (!forwardHeaders['content-type'] && request.method === 'POST') forwardHeaders['content-type'] = 'application/json';
+        const init = { method: request.method, headers: forwardHeaders, redirect: 'follow' };
+        if (request.method === 'POST') init.body = await request.text();
+        const upstream = await fetch(parsed.href, init);
+        const respHeaders = new Headers(corsHeaders(origin));
+        respHeaders.set('Content-Type', upstream.headers.get('Content-Type') || 'application/json; charset=utf-8');
+        const requestId = upstream.headers.get('request-id') || upstream.headers.get('x-request-id');
+        if (requestId) respHeaders.set('x-request-id', requestId);
+        // upstream.body 直接回传：SSE 流式逐块到达，不会在 Worker 侧攒整包。
+        return new Response(upstream.body, { status: upstream.status, headers: respHeaders });
+      } catch (e) {
+        return jsonResponse({ error: 'LLM upstream fetch failed', detail: String(e && e.message || e) }, { status: 502, origin });
       }
     }
 

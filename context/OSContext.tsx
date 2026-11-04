@@ -66,6 +66,7 @@ import { loadChatInputPreferences, saveChatInputPreferences } from '../utils/cha
 import { collectAppearance, collectCharSettings, collectDataScale, collectFeatureFlagsAsync, collectSARFeatureFlags } from '../utils/analyticsSnapshot';
 import { normalizeApiConfig, normalizeApiPreset } from '../utils/apiConfigNormalize';
 import { fetchLlm } from '../utils/anthropicApi';
+import { buildLlmRelayUrl, isLlmRelayCandidateUrl, markLlmHostNeedsRelay, shouldRelayLlmUrl } from '../utils/llmRelay';
 import { getCheckPhoneApi, setCheckPhoneApi } from '../utils/checkPhoneApi';
 import { markBackupDone } from '../utils/backupReminder';
 import { collectSARLocalBackup, restoreSARLocalBackup } from '../utils/vrWorld/sarBackup';
@@ -1268,8 +1269,29 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               apiRequestCaptureId = captureApiRequestOnce({ url: urlStr, body: (sendArgs[1] as any)?.body, meta: captureMeta });
           }
 
+          // 海外 LLM 代理转发（utils/llmRelay.ts）：已知无 CORS 的域名（英伟达/OpenAI）和
+          // 本机学到过直连失败的域名，请求直接改写到代理 Worker 的 /llm 路由，不做注定失败的
+          // 直连（CORS 失败时上游可能已经计费生成过一次）。改写发生在 transport 层：fetchLlm
+          // 的 Anthropic 转换仍按原始逻辑地址判断，调用记录/日志看到的也还是原始地址。
+          const relayLlm = shouldRelayLlmUrl(urlStr);
+          let transport = originalFetch;
+          if (relayLlm) {
+              transport = ((resource: RequestInfo | URL, relayInit?: RequestInit) => {
+                  const innerUrl = typeof resource === 'string'
+                      ? resource
+                      : resource instanceof URL
+                          ? resource.href
+                          : resource.url;
+                  const relayed = buildLlmRelayUrl(innerUrl);
+                  if (typeof Request !== 'undefined' && resource instanceof Request && !relayInit) {
+                      return originalFetch(new Request(relayed, resource));
+                  }
+                  return originalFetch(relayed, relayInit);
+              }) as typeof fetch;
+          }
+
           try {
-              let response = await fetchLlm(sendArgs[0], sendArgs[1], originalFetch, true);
+              let response = await fetchLlm(sendArgs[0], sendArgs[1], transport, true);
 
               // /chat/completions 是可能已经开始计费的请求。拿到任何 HTTP 响应后都不在
               // 兼容层静默重发：中转站可能在返回错误前已经把任务交给上游，重发会让用户
@@ -1360,6 +1382,26 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           } catch (err: any) {
               const requestSignal = (sendArgs[1] as RequestInit | undefined)?.signal || (sendArgs[0] instanceof Request ? sendArgs[0].signal : undefined);
               if (isHomeAssetDisposal(err, requestSignal, urlStr)) throw err;
+              // 海外 LLM 兜底：直连抛网络型错误（Failed to fetch / 响应被 CORS 拦截）时，把域名
+              // 记进转发名单，之后的请求改走代理 Worker。GET（拉模型列表）无副作用，立即经代理
+              // 自动重试一次；POST 生成类请求遵守"可能已计费、不静默重发"的约定，只学习域名，
+              // 用户重新发送的下一条起就走代理了。
+              if (!relayLlm && isLlmRelayCandidateUrl(urlStr) && classifyFetchFailure({ url: urlStr, error: err }) === 'blocked') {
+                  let relayHost = '';
+                  try { relayHost = new URL(urlStr).hostname; } catch { /* 非法地址不学习 */ }
+                  if (relayHost) {
+                      markLlmHostNeedsRelay(relayHost);
+                      setSystemLogs(prev => [{
+                          id: `log-${Date.now()}-llmrelay`,
+                          timestamp: Date.now(),
+                          type: 'network',
+                          source: 'LLM Relay',
+                          message: `已切换为代理转发：${relayHost}`,
+                          detail: `直连 ${relayHost} 失败（响应被 CORS 拦截或网络不可达）。之后发往该域名的 LLM 请求将经「设置 → 网络代理 (Worker)」的 /llm 路由转发；Key 只透传给服务商，Worker 不存储。${method === 'GET' ? '' : '\n生成类请求不自动重发（避免重复计费），请重新发送上一条。'}`,
+                      }, ...prev.slice(0, 49)]);
+                      if (method === 'GET') return patchedFetch(...args);
+                  }
+              }
               // Network Failure
               if (urlStr.includes('/chat/completions')) {
                   updateApiRequestCaptureUsage({ captureId: apiRequestCaptureId, ok: false });

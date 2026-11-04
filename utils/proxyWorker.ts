@@ -11,6 +11,7 @@
  *   - 麦当劳 / 瑞幸 点单 MCP                   → /mcp/mcd /mcp/luckin
  *   - Cloudflare API 中转（一键部署后端用）    → /cf-api
  *   - 好友圈微博扫码和只读同步                → /weibo
+ *   - 海外 LLM 白名单透传（绕 CORS / 直连不可达）→ /llm（客户端见 utils/llmRelay.ts）
  *
  * 默认指向作者部署的公共实例。如果作者哪天不再维护、或你想完全自托管，
  * 把自己部署的 worker 地址填进「设置 → 网络代理 (Worker)」即可，
