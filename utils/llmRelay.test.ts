@@ -1,10 +1,16 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   buildLlmRelayUrl,
+  buildWorkerLlmRelayUrl,
+  getLlmRelayRoute,
   isLlmRelayCandidateUrl,
+  isLlmRelayUnavailableResponse,
   isPrivateLlmHost,
+  LLM_RELAY_HEADER,
   markLlmHostNeedsRelay,
+  markLlmRelayApiUnavailable,
   resetLlmRelayLearnedHosts,
+  resetLlmRelayRoute,
   shouldRelayLlmUrl,
 } from './llmRelay';
 import { DEFAULT_PROXY_WORKER, setProxyWorkerUrl } from './proxyWorker';
@@ -13,6 +19,7 @@ describe('llmRelay 海外 LLM 代理转发', () => {
   beforeEach(() => {
     localStorage.clear();
     resetLlmRelayLearnedHosts();
+    resetLlmRelayRoute();
   });
 
   it('识别 LLM 请求地址：chat/completions、Anthropic /messages、/models', () => {
@@ -66,14 +73,52 @@ describe('llmRelay 海外 LLM 代理转发', () => {
 
   it('转发地址构造：target 全量编码，跟随用户配置的 Worker', () => {
     const target = 'https://integrate.api.nvidia.com/v1/chat/completions';
-    expect(buildLlmRelayUrl(target)).toBe(
+    expect(buildWorkerLlmRelayUrl(target)).toBe(
       `${DEFAULT_PROXY_WORKER}/llm?target=${encodeURIComponent(target)}`,
     );
     setProxyWorkerUrl('https://my-worker.example.com/');
-    expect(buildLlmRelayUrl(target)).toBe(
+    expect(buildWorkerLlmRelayUrl(target)).toBe(
       `https://my-worker.example.com/llm?target=${encodeURIComponent(target)}`,
     );
     setProxyWorkerUrl('');
+  });
+
+  it('路由选择：浏览器默认同源 /api/llm，学到不可用后切 Worker；无 window 时用 Worker', () => {
+    const target = 'https://integrate.api.nvidia.com/v1/chat/completions';
+    // node 测试环境没有 window：等同原生壳 / file://，直接 Worker 路由
+    expect(getLlmRelayRoute()).toBe('worker');
+    // 模拟浏览器页面环境（stub 一个 http(s) window）
+    vi.stubGlobal('window', { location: { protocol: 'http:', origin: 'http://localhost' } });
+    expect(getLlmRelayRoute()).toBe('api');
+    expect(buildLlmRelayUrl(target)).toBe(
+      `http://localhost/api/llm?target=${encodeURIComponent(target)}`,
+    );
+    markLlmRelayApiUnavailable();
+    expect(getLlmRelayRoute()).toBe('worker');
+    expect(buildLlmRelayUrl(target)).toBe(
+      `${DEFAULT_PROXY_WORKER}/llm?target=${encodeURIComponent(target)}`,
+    );
+    // 显式指定路由不受学习记录影响
+    expect(buildLlmRelayUrl(target, 'api')).toBe(
+      `http://localhost/api/llm?target=${encodeURIComponent(target)}`,
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it('路由不可用判定：无标识头的 404/HTML 才算路由不存在', () => {
+    const withHeader = (status: number, contentType = 'application/json') =>
+      new Response('{}', { status, headers: { 'content-type': contentType, [LLM_RELAY_HEADER]: 'api' } });
+    const noHeader = (status: number, contentType = 'application/json') =>
+      new Response('x', { status, headers: { 'content-type': contentType } });
+    // 静态托管回退页 / 404：路由不存在
+    expect(isLlmRelayUnavailableResponse(noHeader(404))).toBe(true);
+    expect(isLlmRelayUnavailableResponse(noHeader(405))).toBe(true);
+    expect(isLlmRelayUnavailableResponse(noHeader(200, 'text/html; charset=utf-8'))).toBe(true);
+    // 上游真实响应（带标识头）：就算 4xx 也不能换路由重发（可能已计费）
+    expect(isLlmRelayUnavailableResponse(withHeader(404))).toBe(false);
+    expect(isLlmRelayUnavailableResponse(withHeader(429))).toBe(false);
+    expect(isLlmRelayUnavailableResponse(noHeader(401))).toBe(false);
+    expect(isLlmRelayUnavailableResponse(noHeader(200))).toBe(false);
   });
 
   it('指向代理 Worker 自身的地址不转发（防套娃）', () => {

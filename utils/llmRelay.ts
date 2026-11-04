@@ -10,17 +10,27 @@
  * 策略（在 OSContext 全局 fetch 拦截器里生效，覆盖全部 /chat/completions、
  * /messages、/models 调用点）：
  *   1) 主动转发：KNOWN_NOCORS_HOSTS 里的域名（英伟达 / OpenAI）+ 用户机器上学到过的
- *      域名，请求直接改写到「设置 → 网络代理 (Worker)」的 /llm 路由，不做注定失败的
- *      直连尝试（直连 CORS 失败时上游可能已经计费生成了一次）。
+ *      域名，请求直接改写到转发路由，不做注定失败的直连尝试（直连 CORS 失败时
+ *      上游可能已经计费生成了一次）。
  *   2) 被动学习：直连抛网络型错误（TypeError: Failed to fetch / Load failed）时，把
  *      域名记进 localStorage；GET /models 立即经代理自动重试一次，POST 生成类请求
  *      遵守"不静默重发"约定，只记下域名并提示用户重新发送。
  *
- * key 的去向：转发时 key 仍在 Authorization / x-api-key 头里，经过用户自己配置的
- * 代理 Worker（默认公共实例可在设置里换成自托管）透传给服务商，Worker 不读不存。
- * 私网 / 回环地址永不转发（Worker 也够不着），指向代理 Worker 自身的地址不转发（防环）。
+ * 转发路由有两条，自动选择、自动降级，用户零配置：
+ *   - 'api'    同源 /api/llm：随网站一起部署（Vercel api/llm.ts、Netlify 经
+ *              netlify.toml 重写、vite dev 中间件），优先使用。纯静态托管没有
+ *              这个路由时，响应是没有转发标识头的 404/HTML——请求根本没出站，
+ *              换路由安全重发，并把选择记进 localStorage。
+ *   - 'worker' 「设置 → 网络代理 (Worker)」的 /llm 路由：自托管 Worker 或作者
+ *              公共实例，作为同源路由不可用时的兜底，也是原生 App / file:// 的
+ *              首选（原生壳的 https://localhost 没有 /api）。
+ *
+ * key 的去向：转发时 key 仍在 Authorization / x-api-key 头里，只经过用户自己
+ * 部署的站点/Worker 透传给服务商，不读不存。私网 / 回环地址永不转发，指向代理
+ * 自身的地址不转发（防环）。
  */
 
+import { Capacitor } from '@capacitor/core';
 import { getProxyWorkerUrl } from './proxyWorker';
 
 /** 已确认浏览器直连必挂（无 CORS）的官方域名，从第一次请求起就走代理。 */
@@ -109,5 +119,67 @@ export const shouldRelayLlmUrl = (url: string): boolean => {
 };
 
 /** 把目标 LLM 地址改写成经代理 Worker 转发的地址。 */
-export const buildLlmRelayUrl = (targetUrl: string, proxyBase: string = getProxyWorkerUrl()): string =>
+export const buildWorkerLlmRelayUrl = (targetUrl: string, proxyBase: string = getProxyWorkerUrl()): string =>
     `${proxyBase.replace(/\/+$/, '')}/llm?target=${encodeURIComponent(targetUrl)}`;
+
+// ─── 转发路由选择（同源 /api/llm 优先，Worker 兜底） ───
+
+export type LlmRelayRoute = 'api' | 'worker';
+
+/** 转发层在响应上打的标识头（见 api/llm-shared.ts / worker /llm）。 */
+export const LLM_RELAY_HEADER = 'x-sully-llm-relay';
+
+const ROUTE_LS_KEY = 'sully_llm_relay_route_v1';
+
+const isNativeCapacitor = (): boolean => {
+    try { return Capacitor.isNativePlatform(); } catch { return false; }
+};
+
+/** 同源 /api/llm 只有在真浏览器 + http(s) 页面时才可能存在。 */
+export const isSameOriginRelayEligible = (): boolean => {
+    if (typeof window === 'undefined' || typeof window.location === 'undefined') return false;
+    const proto = window.location.protocol || '';
+    if (proto !== 'http:' && proto !== 'https:') return false;
+    // 原生壳的页面源是 https://localhost / capacitor://localhost，背后没有 serverless。
+    if (isNativeCapacitor()) return false;
+    return true;
+};
+
+/** 当前应使用的转发路由：显式学到过就用学到的，否则能同源就同源。 */
+export const getLlmRelayRoute = (): LlmRelayRoute => {
+    let stored: string | null = null;
+    try { stored = localStorage.getItem(ROUTE_LS_KEY); } catch { /* ignore */ }
+    if (stored === 'worker') return 'worker';
+    if (stored === 'api') return isSameOriginRelayEligible() ? 'api' : 'worker';
+    return isSameOriginRelayEligible() ? 'api' : 'worker';
+};
+
+/** 同源 /api/llm 不存在（纯静态托管）：之后直接用 Worker 路由。 */
+export const markLlmRelayApiUnavailable = (): void => {
+    try { localStorage.setItem(ROUTE_LS_KEY, 'worker'); } catch { /* ignore */ }
+};
+
+/** 测试用：清掉路由学习记录。 */
+export const resetLlmRelayRoute = (): void => {
+    try { localStorage.removeItem(ROUTE_LS_KEY); } catch { /* ignore */ }
+};
+
+/** 构造转发地址。route 缺省按 getLlmRelayRoute() 自动选。 */
+export const buildLlmRelayUrl = (targetUrl: string, route: LlmRelayRoute = getLlmRelayRoute()): string => {
+    if (route === 'api' && typeof window !== 'undefined' && window.location?.origin) {
+        return `${window.location.origin}/api/llm?target=${encodeURIComponent(targetUrl)}`;
+    }
+    return buildWorkerLlmRelayUrl(targetUrl);
+};
+
+/**
+ * 转发响应是否说明「这条路由根本不存在」（纯静态托管把 /api/llm 回退成
+ * index.html 或 404）。特征：没有转发标识头 + 404/405/HTML。此时请求没出过站，
+ * 换路由重发是安全的（不会重复计费）。有标识头的是上游真实响应，不许动。
+ */
+export const isLlmRelayUnavailableResponse = (response: Response): boolean => {
+    if (response.headers.get(LLM_RELAY_HEADER)) return false;
+    if (response.status === 404 || response.status === 405) return true;
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    return contentType.includes('text/html');
+};

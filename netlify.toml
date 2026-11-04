@@ -10,3 +10,10 @@
 
   [headers.values]
     Service-Worker-Allowed = "/"
+
+# /api/llm → Netlify Function（海外 LLM 透传，与 Vercel 的 api/llm.ts 同路径对齐）
+[[redirects]]
+  from = "/api/llm"
+  to = "/.netlify/functions/llm-proxy"
+  status = 200
+  force = true

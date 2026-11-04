@@ -297,7 +297,7 @@ function corsHeaders(origin) {
     "Access-Control-Allow-Origin": origin || "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization, xi-api-key, model, language, X-MiniMax-Region, X-MiniMax-API-Key, Depth, X-Brave-API-Key, X-Notion-API-Key, X-Feishu-Token, X-Xhs-Cookie, X-Xhs-Platform, X-Rnote-API-Key, X-Xhs-Experiment-Ack, X-Netease-Cookie, X-WebDAV-Method, X-WebDAV-Depth, X-WebDAV-Range, X-GitHub-Method, X-GitHub-Api-Version, X-CF-Method, Mcp-Session-Id, Accept, Range, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, x-goog-api-key",
-    "Access-Control-Expose-Headers": "Mcp-Session-Id",
+    "Access-Control-Expose-Headers": "Mcp-Session-Id, X-Sully-Llm-Relay, x-request-id",
     "Access-Control-Max-Age": "86400",
   };
 }
@@ -4200,6 +4200,8 @@ export default {
         const upstream = await fetch(parsed.href, init);
         const respHeaders = new Headers(corsHeaders(origin));
         respHeaders.set('Content-Type', upstream.headers.get('Content-Type') || 'application/json; charset=utf-8');
+        // 转发标识头：客户端据此区分"真上游响应"和"静态托管把路由回退成 404/HTML"。
+        respHeaders.set('x-sully-llm-relay', 'worker');
         const requestId = upstream.headers.get('request-id') || upstream.headers.get('x-request-id');
         if (requestId) respHeaders.set('x-request-id', requestId);
         // upstream.body 直接回传：SSE 流式逐块到达，不会在 Worker 侧攒整包。

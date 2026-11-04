@@ -66,7 +66,7 @@ import { loadChatInputPreferences, saveChatInputPreferences } from '../utils/cha
 import { collectAppearance, collectCharSettings, collectDataScale, collectFeatureFlagsAsync, collectSARFeatureFlags } from '../utils/analyticsSnapshot';
 import { normalizeApiConfig, normalizeApiPreset } from '../utils/apiConfigNormalize';
 import { fetchLlm } from '../utils/anthropicApi';
-import { buildLlmRelayUrl, isLlmRelayCandidateUrl, markLlmHostNeedsRelay, shouldRelayLlmUrl } from '../utils/llmRelay';
+import { buildLlmRelayUrl, getLlmRelayRoute, isLlmRelayCandidateUrl, isLlmRelayUnavailableResponse, markLlmHostNeedsRelay, markLlmRelayApiUnavailable, shouldRelayLlmUrl, type LlmRelayRoute } from '../utils/llmRelay';
 import { getCheckPhoneApi, setCheckPhoneApi } from '../utils/checkPhoneApi';
 import { markBackupDone } from '../utils/backupReminder';
 import { collectSARLocalBackup, restoreSARLocalBackup } from '../utils/vrWorld/sarBackup';
@@ -1270,19 +1270,23 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           }
 
           // 海外 LLM 代理转发（utils/llmRelay.ts）：已知无 CORS 的域名（英伟达/OpenAI）和
-          // 本机学到过直连失败的域名，请求直接改写到代理 Worker 的 /llm 路由，不做注定失败的
-          // 直连（CORS 失败时上游可能已经计费生成过一次）。改写发生在 transport 层：fetchLlm
-          // 的 Anthropic 转换仍按原始逻辑地址判断，调用记录/日志看到的也还是原始地址。
+          // 本机学到过直连失败的域名，请求直接改写到转发路由（同源 /api/llm 优先，代理
+          // Worker /llm 兜底），不做注定失败的直连（CORS 失败时上游可能已经计费生成过一次）。
+          // 改写发生在 transport 层：fetchLlm 的 Anthropic 转换仍按原始逻辑地址判断，
+          // 调用记录/日志看到的也还是原始地址。
           const relayLlm = shouldRelayLlmUrl(urlStr);
           let transport = originalFetch;
+          let usedLlmRelayRoute: LlmRelayRoute | null = null;
           if (relayLlm) {
+              usedLlmRelayRoute = getLlmRelayRoute();
+              const relayRoute = usedLlmRelayRoute;
               transport = ((resource: RequestInfo | URL, relayInit?: RequestInit) => {
                   const innerUrl = typeof resource === 'string'
                       ? resource
                       : resource instanceof URL
                           ? resource.href
                           : resource.url;
-                  const relayed = buildLlmRelayUrl(innerUrl);
+                  const relayed = buildLlmRelayUrl(innerUrl, relayRoute);
                   if (typeof Request !== 'undefined' && resource instanceof Request && !relayInit) {
                       return originalFetch(new Request(relayed, resource));
                   }
@@ -1292,6 +1296,22 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
 
           try {
               let response = await fetchLlm(sendArgs[0], sendArgs[1], transport, true);
+
+              // 同源 /api/llm 在纯静态托管上不存在（404/HTML，且无转发标识头）：这次请求
+              // 根本没出站，换 Worker 路由安全重发（GET/POST 都不会重复计费），并记住选择。
+              if (usedLlmRelayRoute === 'api' && isLlmRelayUnavailableResponse(response)) {
+                  try { await response.body?.cancel(); } catch { /* 忽略 */ }
+                  markLlmRelayApiUnavailable();
+                  setSystemLogs(prev => [{
+                      id: `log-${Date.now()}-llmroute`,
+                      timestamp: Date.now(),
+                      type: 'network',
+                      source: 'LLM Relay',
+                      message: '同源 /api/llm 不存在，已切换为 Worker 代理转发',
+                      detail: '当前部署是纯静态托管，没有 /api/llm 转发函数。之后的 LLM 转发请求改走「设置 → 网络代理 (Worker)」的 /llm 路由。',
+                  }, ...prev.slice(0, 49)]);
+                  return patchedFetch(...args);
+              }
 
               // /chat/completions 是可能已经开始计费的请求。拿到任何 HTTP 响应后都不在
               // 兼容层静默重发：中转站可能在返回错误前已经把任务交给上游，重发会让用户

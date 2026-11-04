@@ -17,6 +17,7 @@ export default defineConfig({
       'utils/**/*.test.ts',
       'worker/**/*.test.ts',
       'scripts/**/*.test.ts',
+      'api/**/*.test.ts',
     ],
     // 排除 React 组件 / 浏览器集成测 (没装 jsdom)
     exclude: ['node_modules', '**/node_modules/**', '.worktrees', 'dist'],
