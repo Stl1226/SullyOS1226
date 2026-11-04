@@ -43,6 +43,55 @@ function modelRejectsSamplingParams(model) {
   return false;
 }
 
+// utils/nvidiaProxy.ts
+var NVIDIA_API_HOST = "integrate.api.nvidia.com";
+var NVIDIA_PROXY_PATH = "/.netlify/functions/nvidia-proxy";
+function isNvidiaApiUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && url.hostname.toLowerCase() === NVIDIA_API_HOST;
+  } catch {
+    return false;
+  }
+}
+function buildNvidiaProxyUrl(value, siteOrigin) {
+  if (!isNvidiaApiUrl(value)) return null;
+  const origin = siteOrigin ?? (typeof window !== "undefined" ? window.location.origin : "");
+  if (!origin || !/^https?:\/\//i.test(origin)) return null;
+  try {
+    const target = new URL(value);
+    let path = target.pathname || "/";
+    if (!/^\/v1(?:\/|$)/.test(path)) {
+      path = path === "/" ? "/v1" : `/v1${path}`;
+    }
+    const proxy = new URL(NVIDIA_PROXY_PATH, origin);
+    proxy.searchParams.set("path", path + target.search);
+    return proxy.href;
+  } catch {
+    return null;
+  }
+}
+async function redirectNvidiaRequest(resource, init, inputUrl, siteOrigin) {
+  const url = buildNvidiaProxyUrl(inputUrl, siteOrigin);
+  if (!url) return null;
+  if (resource instanceof Request) {
+    const method = (init?.method || resource.method || "GET").toUpperCase();
+    let body = init?.body;
+    if (body === void 0 && method !== "GET" && method !== "HEAD") {
+      body = await resource.clone().text();
+    }
+    const headers = new Headers(resource.headers);
+    if (init?.headers) {
+      new Headers(init.headers).forEach((value, name) => headers.set(name, value));
+    }
+    return {
+      url,
+      init: { ...init, method, headers, body, signal: init?.signal ?? resource.signal }
+    };
+  }
+  return { url, init: init || {} };
+}
+
 // utils/anthropicApi.ts
 var ephemeral = { type: "ephemeral" };
 var finishReason = (reason) => reason === "tool_use" ? "tool_calls" : reason === "max_tokens" ? "length" : "stop";
@@ -284,6 +333,10 @@ function convertAnthropicStream(response) {
 async function fetchLlm(resource, init, transport = globalThis.fetch, browser = typeof window !== "undefined") {
   if (transport.__sullyAnthropic) return transport(resource, init);
   const inputUrl = typeof resource === "string" ? resource : resource instanceof URL ? resource.href : resource.url;
+  if (browser) {
+    const nvidia = await redirectNvidiaRequest(resource, init, inputUrl);
+    if (nvidia) return transport(nvidia.url, nvidia.init);
+  }
   if (!isAnthropicEndpoint(inputUrl)) return transport(resource, init);
   const request = resource instanceof Request ? resource : void 0;
   const method = (init?.method || request?.method || "GET").toUpperCase();
