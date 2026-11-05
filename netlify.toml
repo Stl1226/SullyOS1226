@@ -2,6 +2,10 @@
   functions = "netlify/functions"
   publish = "dist"
 
+# Netlify 上的所有部署（含预览、分支部署）都不显示右下角的构建角标
+[build.environment]
+  VITE_HIDE_BUILD_BADGE = "1"
+
 [functions]
   node_bundler = "esbuild"
 
